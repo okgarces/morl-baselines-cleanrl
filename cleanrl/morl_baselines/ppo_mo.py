@@ -37,7 +37,9 @@ class Args:
 
     # MORL specific arguments
     num_utility_functions: int = 3
-    """the number of utility functions used by the agent"""
+    """the number of utility functions to be trained by the agent"""
+    num_test_utility_functions: int = 10
+    """the number of test utility functions to be tested by the agent"""
 
     # Algorithm specific arguments
     env_id: str = "deep-sea-treasure-v0" # "mo-mountaincar-v0" # "CartPole-v1" TODO How to fix the mountain car?
@@ -111,7 +113,7 @@ def simplex_grid(n, step):
     return [[x * step for x in vec] for vec in results]
 
 class UtilityFunctionLinear(nn.Module):
-    def __init__(self, reward_shape=2, norm=False, weights_step=0.25, function_choice=-1, keep_scale=False):
+    def __init__(self, reward_shape=2, norm=False, weights_step=0.1, function_choice=-1, keep_scale=False):
         super().__init__()
         print('initializing linear utility function')
         self.function_choice = function_choice
@@ -234,6 +236,74 @@ def make_env(env_id, idx, capture_video, run_name):
 
     return thunk
 
+
+def evaluate_policy(policy, env, test_utility_function, num_utility_functions=5, num_test_episodes = 4, device='cpu'):
+    """
+    Evaluate a policy across the different utility functions.
+    """
+
+    for index_test_utility_function in range(num_utility_functions + 5):
+
+        test_utility_function.set_chosen_utility_function(index_test_utility_function)
+
+        episode_objectives = [] # Collect episode objectives from num_test_episodes, the num of episodes use the vector_envs
+        episode_lengths = []
+        episode_utility_returns = []
+        episode_utility_disc_returns = []
+
+        obs, _ = env.reset()
+        trajectories = []
+        current_trajectory = []
+        trajectory_env_index = 0
+
+        while True:
+            with torch.no_grad():
+                obs = torch.tensor(obs).float().to(device)
+                action, *_ = policy.get_action_and_value(obs)
+
+            obs, reward, next_terminations, next_truncations, infos = env.step(action)
+            dones = np.logical_or(next_terminations, next_truncations)
+
+            if 'episode' in infos:
+                episode = infos['episode']
+
+                for index_done, done in enumerate(dones):
+                    if done:
+                        episode_return_env = episode['r'][index_done]
+                        episode_objectives.append(episode_return_env.tolist())
+
+                        episode_length_env = episode['l'][index_done]
+                        episode_lengths.append(episode_length_env)
+
+                        utility_return = episode['ur'][index_done]  # utility returns
+                        episode_utility_returns.append(utility_return)
+
+                        utility_return = episode['disc_ur'][index_done]  # disc utility returns
+                        episode_utility_disc_returns.append(utility_return)
+
+            current_trajectory.append(obs[trajectory_env_index].copy())
+
+            if dones[trajectory_env_index]:
+                trajectories.append(np.array(current_trajectory))
+                current_trajectory = []
+
+            if len(episode_objectives) >= num_test_episodes:
+                break
+
+        ######## Record stats
+        # This is for MORL
+        episode_objectives = np.mean(episode_objectives, axis=0)
+        for objective, episode_return in enumerate(episode_objectives):
+            writer.add_scalar(f"eval/utility_function_{index_test_utility_function + 1}/episodic_return/objective_{objective + 1}", episode_return)
+
+        episode_lengths = np.mean(episode_lengths)
+        writer.add_scalar(f"eval/utility_function_{index_test_utility_function + 1}/episodic_length", episode_lengths)
+        episode_utility_returns = np.mean(episode_utility_returns)
+        writer.add_scalar(f"eval/utility_function_{index_test_utility_function + 1}/utility_returns", episode_utility_returns)
+        episode_utility_disc_returns = np.mean(episode_utility_disc_returns)
+        writer.add_scalar(f"eval/utility_function_{index_test_utility_function + 1}/discounted_utility_returns", episode_utility_disc_returns)
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -314,9 +384,12 @@ if __name__ == "__main__":
 
     envs_list = [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
     envs = mo_gym.wrappers.vector.MOSyncVectorEnv(envs_list)
-    envs = MultiEnvUtilityFunctionESR(envs,
-                                      utility_function=utility_function,
-                                      reward_dim=reward_dim)
+    envs = MultiEnvUtilityFunctionESR(envs, utility_function=utility_function, reward_dim=reward_dim)
+
+    test_utility_function = utility_functions[args.utility_function](reward_dim)
+    test_envs = [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+    test_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(test_envs)
+    test_envs = MultiEnvUtilityFunctionESR(test_envs, utility_function=test_utility_function, reward_dim=reward_dim)
 
     # assert args.num_envs == 1, "Vectorised environments not supported"
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
@@ -374,10 +447,6 @@ if __name__ == "__main__":
                 next_obs, reward, next_terminations, next_truncations, infos = envs.step(action.cpu().numpy())
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_obs, next_terminations, next_truncations = torch.Tensor(next_obs).to(device), torch.Tensor(next_terminations).to(device), torch.Tensor(next_truncations).to(device)
-
-
-                if any(next_terminations):
-                    print(infos)
 
                 # if "_final_info" in infos:
                     # for info in infos["_final_info"]:
@@ -496,6 +565,9 @@ if __name__ == "__main__":
             writer.add_scalar(f"losses/utility_function_{to_train_utility_function + 1}/explained_variance", explained_var, global_step)
             print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar(f"charts/utility_function_{to_train_utility_function + 1}/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        ### TODO - single policy evaluation. I haven't computed the MORL metrics: EU and HV.
+        evaluate_policy(agent, test_envs, test_utility_function, args.num_utility_functions, 4, device)
 
     envs.close()
     writer.close()
